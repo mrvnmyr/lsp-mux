@@ -146,7 +146,7 @@ func (s *Server) Serve() int {
 			continue
 		}
 		if s.cfg.Verbose {
-			fmt.Fprintf(os.Stderr, "[mux] accepted client fd=%d\n", conn.Fd())
+			fmt.Fprintf(os.Stderr, "[mux] accepted client remote=%v local=%v\n", conn.RemoteAddr(), conn.LocalAddr())
 		}
 		cc := &clientConn{
 			id:   s.allocClientID(),
