@@ -46,8 +46,8 @@ func runFakeLSPServer() {
 			// Reply with simple server capabilities
 			res := map[string]any{
 				"capabilities": map[string]any{
-					"hoverProvider": true,
-					"definitionProvider": true,
+					"hoverProvider":       true,
+					"definitionProvider":  true,
 				},
 				"serverInfo": map[string]string{
 					"name":    "fake-lsp",
@@ -90,7 +90,7 @@ func runFakeLSPServer() {
 				"code":    -32601,
 				"message": "method not found",
 			}
-				// NOTE: keep fields to spec
+			// NOTE: keep fields to spec
 			reply := struct {
 				JSONRPC string          `json:"jsonrpc"`
 				ID      json.RawMessage `json:"id"`
@@ -249,6 +249,21 @@ func TestTripleOpenCloseReuse(t *testing.T) {
 	}
 	// initialized (will be dropped by mux if already forwarded once)
 	_ = writeBody(conn, mustMarshal(Message{JSONRPC: "2.0", Method: "initialized"}))
+
+	// Do one more echo in session 3 to validate reuse across yet another client.
+	echoReq3 := Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("303"),
+		Method:  "fake/echo",
+		Params:  mustMarshal(map[string]string{"msg": "hello-3"}),
+	}
+	if err := writeBody(conn, mustMarshal(echoReq3)); err != nil {
+		t.Fatalf("session 3: write echo: %v", err)
+	}
+	if _, err := readFrame(r); err != nil {
+		t.Fatalf("session 3: read echo resp: %v", err)
+	}
+
 	// getCounts
 	getCounts := Message{
 		JSONRPC: "2.0",
