@@ -31,6 +31,10 @@ type Server struct {
 	initDone         bool
 	initResult       json.RawMessage
 	initializedSent  bool
+	initInFlight     bool
+	initProxyID      uint64
+	pendingInitMu    sync.Mutex
+	pendingInit      []pendingInitResp
 	pendingReqsMu    sync.Mutex
 	nextProxyID      uint64
 	pendingByProxyID map[uint64]reqMap // server responses -> client
@@ -59,6 +63,11 @@ type serverReq struct {
 	clientID       int
 	origID         json.RawMessage // server's original id
 	clientIDOnWire json.RawMessage // id we used when sending to client
+}
+
+type pendingInitResp struct {
+	clientID int
+	origID   json.RawMessage
 }
 
 func NewServer(cfg ServerConfig) (*Server, error) {
@@ -262,6 +271,31 @@ func (s *Server) loopServerRead() {
 				delete(s.pendingByProxyID, key)
 			}
 			s.pendingReqsMu.Unlock()
+
+			// If this is the response to the very first initialize, cache it and flush any queued clients.
+			if key == s.initProxyID && !s.initDone {
+				s.initDone = true
+				s.initInFlight = false
+				s.initResult = m.Result
+				if s.cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "[mux] cached initialize result (proxyID=%d); replying to pending clients=%d\n", key, len(s.pendingInit))
+				}
+				// Reply to queued initialize requests with the cached result
+				s.pendingInitMu.Lock()
+				for _, q := range s.pendingInit {
+					resp := Message{
+						JSONRPC: "2.0",
+						ID:      q.origID,
+						Result:  s.initResult,
+					}
+					if c := s.getClient(q.clientID); c != nil {
+						c.write(mustMarshal(resp))
+					}
+				}
+				s.pendingInit = nil
+				s.pendingInitMu.Unlock()
+			}
+
 			if ok {
 				// Rewrite id back to client's original id and forward only to that client
 				newBody, err := replaceID(body, pm.origID)
@@ -339,31 +373,47 @@ func (s *Server) handleClient(c *clientConn) {
 		// Intercept initialize, initialized, shutdown/exit
 		if isRequest(&m) && m.Method == "initialize" {
 			// First client's initialize goes to real LSP;
-			// subsequent clients receive cached result.
-			if !s.initDone {
-				if s.cfg.Verbose {
-					fmt.Fprintf(os.Stderr, "[mux] client #%d forwarding initialize to server\n", c.id)
-				}
-				// Forward to LSP server; map its id
-				s.forwardClientRequest(c.id, body, m, true)
-			} else {
+			// additional clients before init completes are queued and answered later.
+			if s.initDone {
 				if s.cfg.Verbose {
 					fmt.Fprintf(os.Stderr, "[mux] client #%d served cached initialize\n", c.id)
 				}
-				// Respond locally with cached result
 				resp := Message{
 					JSONRPC: "2.0",
 					ID:      m.ID,
 					Result:  s.initResult,
 				}
 				c.write(mustMarshal(resp))
+			} else if !s.initInFlight {
+				if s.cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "[mux] client #%d forwarding first initialize to server\n", c.id)
+				}
+				proxyID, _ := s.forwardClientRequest(c.id, body, m)
+				s.initInFlight = true
+				s.initProxyID = proxyID
+			} else {
+				// queue
+				if s.cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "[mux] client #%d queued initialize awaiting server response\n", c.id)
+				}
+				s.pendingInitMu.Lock()
+				s.pendingInit = append(s.pendingInit, pendingInitResp{
+					clientID: c.id,
+					origID:   m.ID,
+				})
+				s.pendingInitMu.Unlock()
 			}
 			continue
 		}
 		if isNotification(&m) && m.Method == "initialized" {
 			if !s.initializedSent {
+				if s.cfg.Verbose {
+					fmt.Fprintln(os.Stderr, "[mux] forwarding single 'initialized' to server")
+				}
 				s.initializedSent = true
 				s.writeToServer(body)
+			} else if s.cfg.Verbose {
+				fmt.Fprintln(os.Stderr, "[mux] dropping extra 'initialized' from a client")
 			}
 			continue
 		}
@@ -383,7 +433,7 @@ func (s *Server) handleClient(c *clientConn) {
 		}
 
 		if isRequest(&m) {
-			s.forwardClientRequest(c.id, body, m, false)
+			_, _ = s.forwardClientRequest(c.id, body, m)
 			continue
 		}
 
@@ -404,7 +454,7 @@ func (s *Server) handleClient(c *clientConn) {
 	}
 }
 
-func (s *Server) forwardClientRequest(clientID int, body []byte, m Message, markMaybeInit bool) {
+func (s *Server) forwardClientRequest(clientID int, body []byte, m Message) (uint64, error) {
 	// Allocate proxy id
 	s.pendingReqsMu.Lock()
 	s.nextProxyID++
@@ -418,26 +468,13 @@ func (s *Server) forwardClientRequest(clientID int, body []byte, m Message, mark
 	// Replace id
 	newBody, err := replaceID(body, json.RawMessage(fmt.Sprintf("%d", proxyID)))
 	if err != nil {
-		return
+		return 0, err
 	}
-
-	// If this might be initialize, capture result when response arrives
-	if markMaybeInit && m.Method == "initialize" {
-		if s.cfg.Verbose {
-			fmt.Fprintf(os.Stderr, "[mux] tracking initialize proxyID=%d for client #%d\n", proxyID, clientID)
-		}
-		// Wrap the pending mapping: when loopServerRead routes the response back,
-		// we also cache the result for subsequent clients.
-		origForward := s.pendingByProxyID[proxyID]
-		s.pendingByProxyID[proxyID] = reqMap{
-			clientID: origForward.clientID,
-			origID:   origForward.origID,
-		}
-		// Intercept in writeToServer? We'll instead detect below after write by peeking id;
-		// caching happens when we forward response to the first client:
-		// we attempt to decode and store initialize result.
+	if s.cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[mux] fwd client #%d -> server: method=%s proxyID=%d\n", clientID, m.Method, proxyID)
 	}
 	s.writeToServer(newBody)
+	return proxyID, nil
 }
 
 func (s *Server) handleClientResponse(clientID int, body []byte, m Message) {
