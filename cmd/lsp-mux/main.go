@@ -35,7 +35,7 @@ func parseCLI() (*cliConfig, []string) {
 	cfg := &cliConfig{
 		socketDir: defaultSocketDir(),
 		tagFile:   ".lspmux",
-		linger:    10 * time.Minute,
+		linger:    1 * time.Minute,
 	}
 
 	// We need to capture args after "--" as the real LSP server command-line suffix.
