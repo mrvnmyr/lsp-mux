@@ -20,15 +20,15 @@ import (
 // ------- CLI parsing helpers -------
 
 type cliConfig struct {
-	modeServe   bool
-	socketPath  string
-	rootDir     string
-	lang        string
-	serverCmd   []string
-	socketDir   string
-	tagFile     string
-	linger      time.Duration
-	verbose     bool
+	modeServe  bool
+	socketPath string
+	rootDir    string
+	lang       string
+	serverCmd  []string
+	socketDir  string
+	tagFile    string
+	linger     time.Duration
+	verbose    bool
 }
 
 func parseCLI() (*cliConfig, []string) {

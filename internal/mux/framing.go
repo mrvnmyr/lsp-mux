@@ -73,7 +73,7 @@ func replaceID(msg []byte, newID json.RawMessage) ([]byte, error) {
 }
 
 func isRequest(m *Message) bool {
- 	return m.Method != "" && len(m.ID) > 0
+	return m.Method != "" && len(m.ID) > 0
 }
 
 func isNotification(m *Message) bool {
