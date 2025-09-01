@@ -145,22 +145,13 @@ func readOneFrame(r *bufio.Reader) (body []byte, rawFrame []byte, err error) {
 	return body, raw, nil
 }
 
-func writeFrame(w io.Writer, body []byte) error {
-	_, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(body))
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(body)
-	return err
-}
-
 // --------- init param helpers ---------
 
 type initializeParams struct {
 	RootURI          string `json:"rootUri"`
 	RootPath         string `json:"rootPath"`
 	WorkspaceFolders []struct {
-		URI string `json:"uri"`
+		URI  string `json:"uri"`
 		Name string `json:"name"`
 	} `json:"workspaceFolders"`
 }

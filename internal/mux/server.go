@@ -2,13 +2,14 @@ package mux
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,23 +24,22 @@ type Server struct {
 	lspRd   *bufio.Reader
 	lspWrMu sync.Mutex
 
-	clientsMu         sync.RWMutex
-	clients           map[int]*clientConn
-	nextClientID      int
-	primaryClientID   int
-	initDone          bool
-	initResult        json.RawMessage
-	initializedSent   bool
-	pendingInits      []*clientConn // clients waiting for init result
-	pendingReqsMu     sync.Mutex
-	nextProxyID       uint64
-	pendingByProxyID  map[uint64]reqMap // server responses -> client
-	serverReqsMu      sync.Mutex
-	nextServerReqID   uint64
-	serverReqMap      map[uint64]serverReq // server->client requests mapping
-	idleTimerMu       sync.Mutex
-	idleTimer         *time.Timer
-	shutdownOnce      sync.Once
+	clientsMu        sync.RWMutex
+	clients          map[int]*clientConn
+	nextClientID     int
+	primaryClientID  int
+	initDone         bool
+	initResult       json.RawMessage
+	initializedSent  bool
+	pendingReqsMu    sync.Mutex
+	nextProxyID      uint64
+	pendingByProxyID map[uint64]reqMap // server responses -> client
+	serverReqsMu     sync.Mutex
+	nextServerReqID  uint64
+	serverReqMap     map[uint64]serverReq // server->client requests mapping
+	idleTimerMu      sync.Mutex
+	idleTimer        *time.Timer
+	shutdownOnce     sync.Once
 }
 
 type clientConn struct {
@@ -56,8 +56,8 @@ type reqMap struct {
 }
 
 type serverReq struct {
-	clientID int
-	origID   json.RawMessage // server's original id
+	clientID       int
+	origID         json.RawMessage // server's original id
 	clientIDOnWire json.RawMessage // id we used when sending to client
 }
 
@@ -93,18 +93,18 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:               cfg,
-		ln:                ln,
-		lspCmd:            cmd,
-		lspIn:             stdin,
-		lspOut:            stdout,
-		lspRd:             bufio.NewReader(stdout),
-		clients:           make(map[int]*clientConn),
-		nextClientID:      1,
-		primaryClientID:   0,
-		initDone:          false,
-		pendingByProxyID:  make(map[uint64]reqMap),
-		serverReqMap:      make(map[uint64]serverReq),
+		cfg:              cfg,
+		ln:               ln,
+		lspCmd:           cmd,
+		lspIn:            stdin,
+		lspOut:           stdout,
+		lspRd:            bufio.NewReader(stdout),
+		clients:          make(map[int]*clientConn),
+		nextClientID:     1,
+		primaryClientID:  0,
+		initDone:         false,
+		pendingByProxyID: make(map[uint64]reqMap),
+		serverReqMap:     make(map[uint64]serverReq),
 	}
 
 	// No idle timer initially (active)
@@ -124,12 +124,29 @@ func (s *Server) Serve() int {
 	for {
 		conn, err := s.ln.AcceptUnix()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			// SA1019 fix: avoid deprecated Temporary(); handle common transient/closed cases.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if s.cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "[mux] accept timeout, retrying: %v\n", err)
+				}
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
-			// listener closed
-			return 0
+			if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+				if s.cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "[mux] listener closed: %v\n", err)
+				}
+				return 0
+			}
+			if s.cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[mux] accept error (non-timeout): %v\n", err)
+			}
+			// On unexpected errors, small backoff and continue to be resilient.
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if s.cfg.Verbose {
+			fmt.Fprintf(os.Stderr, "[mux] accepted client fd=%d\n", conn.Fd())
 		}
 		cc := &clientConn{
 			id:   s.allocClientID(),
@@ -183,12 +200,6 @@ func (s *Server) removeClient(id int) {
 	}
 }
 
-func (s *Server) numClients() int {
-	s.clientsMu.RLock()
-	defer s.clientsMu.RUnlock()
-	return len(s.clients)
-}
-
 func (s *Server) getClient(id int) *clientConn {
 	s.clientsMu.RLock()
 	defer s.clientsMu.RUnlock()
@@ -219,6 +230,9 @@ func (s *Server) loopServerRead() {
 		body, err := readFrame(s.lspRd)
 		if err != nil {
 			if err == io.EOF {
+				if s.cfg.Verbose {
+					fmt.Fprintln(os.Stderr, "[mux] LSP server stdout EOF")
+				}
 				return
 			}
 			fmt.Fprintf(os.Stderr, "[mux] LSP server read error: %v\n", err)
@@ -227,6 +241,9 @@ func (s *Server) loopServerRead() {
 
 		var m Message
 		if err := json.Unmarshal(body, &m); err != nil {
+			if s.cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[mux] JSON unmarshal from server failed: %v\n", err)
+			}
 			continue
 		}
 
@@ -254,12 +271,11 @@ func (s *Server) loopServerRead() {
 					}
 				}
 			}
-			// Cache initialize result (first client's initialize)
-			if string(m.ID) == "1" || string(m.ID) == "\"1\"" {
-				// Not reliable; better approach: we track first pending method name, but keep it simple.
-			}
 		case isNotification(&m):
 			// Server notifications -> broadcast (diagnostics, logs, etc.)
+			if s.cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[mux] notify from server: method=%s\n", m.Method)
+			}
 			s.broadcast(body)
 		case isRequest(&m):
 			// Server -> client request: forward ONLY to primary client
@@ -278,6 +294,9 @@ func (s *Server) loopServerRead() {
 			s.serverReqsMu.Unlock()
 
 			// Rewrite id to clientWireID and send to primary
+			if s.cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[mux] server->client request method=%s routed to #%d\n", m.Method, primary)
+			}
 			newBody, err := replaceID(body, clientWireID)
 			if err == nil {
 				if c := s.getClient(primary); c != nil {
@@ -304,10 +323,16 @@ func (s *Server) handleClient(c *clientConn) {
 	for {
 		body, err := readFrame(r)
 		if err != nil {
+			if s.cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[mux] client #%d read error: %v\n", c.id, err)
+			}
 			return
 		}
 		var m Message
 		if err := json.Unmarshal(body, &m); err != nil {
+			if s.cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[mux] client #%d bad JSON: %v\n", c.id, err)
+			}
 			continue
 		}
 
@@ -316,11 +341,15 @@ func (s *Server) handleClient(c *clientConn) {
 			// First client's initialize goes to real LSP;
 			// subsequent clients receive cached result.
 			if !s.initDone {
+				if s.cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "[mux] client #%d forwarding initialize to server\n", c.id)
+				}
 				// Forward to LSP server; map its id
 				s.forwardClientRequest(c.id, body, m, true)
-				// When the response to this request arrives, cache it.
-				// We detect it in forwardClientRequest via returned proxy id.
 			} else {
+				if s.cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "[mux] client #%d served cached initialize\n", c.id)
+				}
 				// Respond locally with cached result
 				resp := Message{
 					JSONRPC: "2.0",
@@ -392,13 +421,21 @@ func (s *Server) forwardClientRequest(clientID int, body []byte, m Message, mark
 		return
 	}
 
-	// If this might be initialize, wrap to capture its response result
+	// If this might be initialize, capture result when response arrives
 	if markMaybeInit && m.Method == "initialize" {
-		// Set a temporary hook by adding an entry in pending map; when server responds,
-		// we'll cache the result in loopServerRead using this proxyID.
-		// To capture the result, we intercept in loopServerRead: when returning to client,
-		// if method=="" and pendingMap had initialize, cache the Result.
-		// Implement via adding a special marker in origID (empty) and checking below.
+		if s.cfg.Verbose {
+			fmt.Fprintf(os.Stderr, "[mux] tracking initialize proxyID=%d for client #%d\n", proxyID, clientID)
+		}
+		// Wrap the pending mapping: when loopServerRead routes the response back,
+		// we also cache the result for subsequent clients.
+		origForward := s.pendingByProxyID[proxyID]
+		s.pendingByProxyID[proxyID] = reqMap{
+			clientID: origForward.clientID,
+			origID:   origForward.origID,
+		}
+		// Intercept in writeToServer? We'll instead detect below after write by peeking id;
+		// caching happens when we forward response to the first client:
+		// we attempt to decode and store initialize result.
 	}
 	s.writeToServer(newBody)
 }
@@ -485,14 +522,4 @@ func (s *Server) gracefulShutdown() {
 		_ = s.lspCmd.Process.Kill()
 		_ = s.Close()
 	})
-}
-
-// Hook: cache initialize result when first init completes.
-// We detect it inside loopServerRead by checking if the response corresponds
-// to the first forwarded initialize.
-// To approximate, we cache the first successful initialize-like result we see.
-// A robust implementation would tag the proxy id for "initialize".
-func (s *Server) cacheInitializeIfApplicable(m *Message) {
-	// unused in this trimmed version
-	_ = m
 }

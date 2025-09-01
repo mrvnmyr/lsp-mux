@@ -2,7 +2,6 @@ package mux
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -74,7 +73,7 @@ func replaceID(msg []byte, newID json.RawMessage) ([]byte, error) {
 }
 
 func isRequest(m *Message) bool {
-	return m.Method != "" && len(m.ID) > 0
+ 	return m.Method != "" && len(m.ID) > 0
 }
 
 func isNotification(m *Message) bool {
@@ -83,12 +82,4 @@ func isNotification(m *Message) bool {
 
 func isResponse(m *Message) bool {
 	return m.Method == "" && (len(m.Result) > 0 || len(m.Error) > 0) && len(m.ID) > 0
-}
-
-// concatFrame reconstructs a raw LSP frame for a given body.
-func concatFrame(body []byte) []byte {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "Content-Length: %d\r\n\r\n", len(body))
-	buf.Write(body)
-	return buf.Bytes()
 }
