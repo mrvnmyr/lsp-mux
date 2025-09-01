@@ -83,7 +83,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		// non-fatal
 	}
 
+	// Prepare the child process but DO NOT start it yet.
+	// This lets callers (including tests) tweak s.lspCmd (e.g., Env) before start.
 	cmd := exec.Command(cfg.ServerCmd[0], cfg.ServerCmd[1:]...)
+	// Ensure we at least inherit the current environment if caller doesn't set one.
+	if len(cmd.Env) == 0 {
+		cmd.Env = os.Environ()
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		_ = ln.Close()
@@ -96,24 +102,24 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	cmd.Stderr = os.Stderr
 
-	if err := cmd.Start(); err != nil {
-		_ = ln.Close()
-		return nil, err
-	}
-
 	s := &Server{
 		cfg:              cfg,
 		ln:               ln,
 		lspCmd:           cmd,
 		lspIn:            stdin,
 		lspOut:           stdout,
-		lspRd:            bufio.NewReader(stdout),
+		// lspRd will be set after Start() in Serve()
 		clients:          make(map[int]*clientConn),
 		nextClientID:     1,
 		primaryClientID:  0,
 		initDone:         false,
 		pendingByProxyID: make(map[uint64]reqMap),
 		serverReqMap:     make(map[uint64]serverReq),
+	}
+
+	if s.cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[mux] NewServer: socket=%s (lang=%s root=%s) — child prepared, not started\n",
+			cfg.SocketPath, cfg.Lang, cfg.RootDir)
 	}
 
 	// No idle timer initially (active)
@@ -127,7 +133,28 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) Serve() int {
+	// Start the LSP child now that callers had a chance to adjust env, etc.
+	if s.cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[mux] Serve: starting LSP server: %v\n", s.cfg.ServerCmd)
+		if len(s.lspCmd.Env) > 0 {
+			// Print a single notable env var for debugging if present.
+			for _, kv := range s.lspCmd.Env {
+				if strings.HasPrefix(kv, "GO_WANT_LSP_HELPER=") {
+					fmt.Fprintf(os.Stderr, "[mux] Serve: env %s\n", kv)
+					break
+				}
+			}
+		}
+	}
+	if err := s.lspCmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: start LSP server: %v\n", err)
+		return 1
+	}
+	if s.cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[mux] Serve: LSP server started (pid=%d)\n", s.lspCmd.Process.Pid)
+	}
 	// Reader from LSP server -> distribute to clients
+	s.lspRd = bufio.NewReader(s.lspOut)
 	go s.loopServerRead()
 
 	for {
@@ -455,7 +482,7 @@ func (s *Server) handleClient(c *clientConn) {
 }
 
 func (s *Server) forwardClientRequest(clientID int, body []byte, m Message) (uint64, error) {
-	// Allocate proxy id
+ 	// Allocate proxy id
 	s.pendingReqsMu.Lock()
 	s.nextProxyID++
 	proxyID := s.nextProxyID
